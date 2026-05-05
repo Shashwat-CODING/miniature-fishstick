@@ -10,7 +10,7 @@ from groq import Groq
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = "98579991087:AAHm-i4Jzsv4mX8lHGgL-lFBnHo164y_GPY"
+TELEGRAM_TOKEN = "8579991087:AAHm-i4Jzsv4mX8lHGgL-lFBnHo164y_GPY"
 GROQ_API_KEY   = "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"
 GROQ_MODEL     = "llama-3.3-70b-versatile"
 MAX_HISTORY    = 20
