@@ -1,4 +1,8 @@
 import logging
+import threading
+import time
+import requests
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from groq import Groq
@@ -10,6 +14,8 @@ TELEGRAM_TOKEN = "98579991087:AAHm-i4Jzsv4mX8lHGgL-lFBnHo164y_GPY"
 GROQ_API_KEY   = "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"
 GROQ_MODEL     = "llama-3.3-70b-versatile"
 MAX_HISTORY    = 20
+RENDER_URL     = "https://miniature-fishstick-9xmr.onrender.com"
+PORT           = 8080
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
@@ -32,7 +38,7 @@ SYSTEM_PROMPT = """You are a highly capable, friendly, and knowledgeable AI assi
 ## Formatting (Telegram markdown)
 - Use *bold* for key terms and headers.
 - Use `inline code` for commands or short snippets.
-- Use ```language blocks for multi-line code.
+- Use triple-backtick language blocks for multi-line code.
 - Numbered lists for steps; bullets for options.
 - Keep responses under ~400 words unless asked for detail.
 - Skip filler like "Certainly!" or "Great question!".
@@ -64,7 +70,7 @@ async def ask_groq(user_id, user_message):
         return reply
     except Exception as e:
         logger.error("Groq error: %s", e)
-        return "⚠️ Error reaching the AI. Please try again."
+        return "Error reaching the AI. Please try again."
 
 def split_text(text, max_len=4000):
     if len(text) <= max_len:
@@ -81,23 +87,53 @@ def split_text(text, max_len=4000):
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or "there"
-    await update.message.reply_text(f"👋 Hey *{name}*! I'm your AI assistant powered by Groq.\n\nAsk me anything — questions, code, writing, translations…\n\nType /help for commands.", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"Hey *{name}*! I'm your AI assistant powered by Groq.\n\nAsk me anything — questions, code, writing, translations…\n\nType /help for commands.",
+        parse_mode="Markdown"
+    )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("*Commands*\n\n/start — Welcome message\n/help — This menu\n/clear — Clear chat history\n/model — Show active AI model", parse_mode="Markdown")
+    await update.message.reply_text(
+        "*Commands*\n\n/start — Welcome message\n/help — This menu\n/clear — Clear chat history\n/model — Show active AI model",
+        parse_mode="Markdown"
+    )
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_histories.pop(update.effective_user.id, None)
-    await update.message.reply_text("🗑️ History cleared!")
+    await update.message.reply_text("History cleared!")
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🤖 Model: `{GROQ_MODEL}`", parse_mode="Markdown")
+    await update.message.reply_text(f"Model: `{GROQ_MODEL}`", parse_mode="Markdown")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     reply = await ask_groq(update.effective_user.id, update.message.text)
     for chunk in split_text(reply):
         await update.message.reply_text(chunk, parse_mode="Markdown")
+
+# Keep-alive HTTP server — Render requires an open port
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, *args):
+        pass
+
+def run_http_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logger.info("Health server listening on port %d", PORT)
+    server.serve_forever()
+
+# Self-ping every 40s to prevent Render free-tier sleep
+def keep_alive():
+    while True:
+        time.sleep(40)
+        try:
+            requests.get(RENDER_URL, timeout=10)
+            logger.info("Pinged %s", RENDER_URL)
+        except Exception as e:
+            logger.warning("Ping failed: %s", e)
 
 async def post_init(app):
     await app.bot.set_my_commands([
@@ -108,6 +144,9 @@ async def post_init(app):
     ])
 
 def main():
+    threading.Thread(target=run_http_server, daemon=True).start()
+    threading.Thread(target=keep_alive, daemon=True).start()
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
