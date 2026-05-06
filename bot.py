@@ -136,7 +136,7 @@ async def ask_groq(user_id: int, user_message: str):
             model=GROQ_MODEL,
             messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
             temperature=1,
-            max_completion_tokens=8192,
+            max_tokens=8192,
             top_p=1,
             reasoning_effort="medium",
             stream=False,
