@@ -210,7 +210,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Tell user we're on it
         wait_msg = await update.message.reply_text("🎨 On it, give me a sec...")
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
-        # Now actually generate
+        # Generate image
+        image_url = generate_image(improved_prompt)
         # Delete the waiting message
         try:
             await wait_msg.delete()
@@ -218,15 +219,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         if image_url:
             try:
-                await update.message.reply_photo(photo=image_url, parse_mode="Markdown")
+                await update.message.reply_photo(photo=image_url)
             except Exception as e:
                 logger.error("Failed to send photo: %s", e)
                 await update.message.reply_text(f"[Image]({image_url})", parse_mode="Markdown")
+            # Add minimal history so model knows what happened, without prompt bloat
+            get_history(update.effective_user.id).append({
+                "role": "assistant",
+                "content": f"Image generated successfully."
+            })
         else:
             await update.message.reply_text("Image server threw a fit 😅 Try again in a bit?")
-        # Update history
-        entry = f"[Generated image for: {improved_prompt}]" if image_url else "[Image generation failed]"
-        get_history(update.effective_user.id).append({"role": "assistant", "content": entry})
+            get_history(update.effective_user.id).append({
+                "role": "assistant",
+                "content": "Image generation failed."
+            })
     else:
         for chunk in split_text(payload):
             await update.message.reply_text(chunk, parse_mode="Markdown")
