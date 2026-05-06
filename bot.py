@@ -212,11 +212,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
         # Generate image
         image_url = generate_image(improved_prompt)
-        # Delete the waiting message
-        try:
-            await wait_msg.delete()
-        except Exception:
-            pass
         if image_url:
             try:
                 await update.message.reply_photo(photo=image_url)
