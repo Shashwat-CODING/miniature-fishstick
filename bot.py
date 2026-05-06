@@ -18,7 +18,7 @@ GROQ_API_KEY   = "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"
 GROQ_MODEL     = "openai/gpt-oss-120b"
 IMAGE_API_BASE = "https://bitter-forest-7e87.shashwat-coding.workers.dev"
 IMAGE_ENDPOINT = "/flux-klein"   # Flux Klein 9B
-MAX_HISTORY    = 20
+MAX_HISTORY    = 10
 RENDER_URL     = "https://miniature-fishstick-9xmr.onrender.com"
 PORT           = 8080
 
@@ -128,7 +128,7 @@ async def ask_groq(user_id: int, user_message: str):
             model=GROQ_MODEL,
             messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
             temperature=0.7,
-            max_completion_tokens=8192,
+            max_completion_tokens=1024,
             top_p=1,
             reasoning_effort="medium",
             reasoning_format="hidden",
