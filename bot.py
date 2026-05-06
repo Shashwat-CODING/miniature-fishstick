@@ -147,16 +147,8 @@ async def ask_groq(user_id: int, user_message: str):
                     improved_prompt = args.get("improved_prompt", "")
 
                     logger.info("Generating image with prompt: %s", improved_prompt)
-                    image_url = generate_image(improved_prompt)
 
-                    if image_url:
-                        caption = f"✨ Here you go!\n\n*Prompt used:* _{improved_prompt}_"
-                        history.append({"role": "assistant", "content": f"[Generated image for: {improved_prompt}]"})
-                        return ("image", (caption, image_url))
-                    else:
-                        reply = "Tried generating that but the image server threw a fit 😅 Try again in a bit?"
-                        history.append({"role": "assistant", "content": reply})
-                        return ("text", reply)
+                    return ("image_pending", improved_prompt)
 
         reply = (message.content or "").strip()
         if not reply:
@@ -213,13 +205,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = await ask_groq(update.effective_user.id, update.message.text)
     kind, payload = result
 
-    if kind == "image":
-        caption, image_url = payload
+    if kind == "image_pending":
+        improved_prompt = payload
+        # Tell user we're on it
+        wait_msg = await update.message.reply_text("🎨 On it, give me a sec...")
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
+        # Now actually generate
+        # Delete the waiting message
         try:
-            await update.message.reply_photo(photo=image_url, caption=caption, parse_mode="Markdown")
-        except Exception as e:
-            logger.error("Failed to send photo: %s", e)
-            await update.message.reply_text(f"{caption}\n\n[Image URL]({image_url})", parse_mode="Markdown")
+            await wait_msg.delete()
+        except Exception:
+            pass
+        if image_url:
+            try:
+                await update.message.reply_photo(photo=image_url, parse_mode="Markdown")
+            except Exception as e:
+                logger.error("Failed to send photo: %s", e)
+                await update.message.reply_text(f"[Image]({image_url})", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("Image server threw a fit 😅 Try again in a bit?")
+        # Update history
+        entry = f"[Generated image for: {improved_prompt}]" if image_url else "[Image generation failed]"
+        get_history(update.effective_user.id).append({"role": "assistant", "content": entry})
     else:
         for chunk in split_text(payload):
             await update.message.reply_text(chunk, parse_mode="Markdown")
