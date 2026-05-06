@@ -49,7 +49,7 @@ SYSTEM_PROMPT = """You are Yashraj — a chill, witty AI assistant created by Sh
   1. First IMPROVE the user's prompt — make it richer, more descriptive, better for AI image models. Add style, lighting, detail, mood etc.
   2. Then call the generate_image tool with your improved prompt.
   3. Tell the user you're generating and briefly mention how you improved their prompt.
-- Example: user says "make a cat" → you use "a fluffy orange tabby cat sitting on a windowsill, soft golden hour lighting, photorealistic, shallow depth of field, 4K"
+- Example: user says "make a cat" -> you use "a fluffy orange tabby cat sitting on a windowsill, soft golden hour lighting, photorealistic, shallow depth of field, 4K"
 
 ## Tools Available
 - browser_search: search the web for current info
@@ -58,7 +58,7 @@ SYSTEM_PROMPT = """You are Yashraj — a chill, witty AI assistant created by Sh
 
 ## Formatting (Telegram Markdown)
 - *bold* for key terms
-- `code` for snippets/commands
+- code for snippets/commands
 - Triple backticks for multi-line code
 - Keep it short by default. Expand only when asked.
 
@@ -73,12 +73,10 @@ def get_history(user_id):
     return user_histories.setdefault(user_id, [])
 
 def get_timestamp():
-    """Returns a human-readable timestamp in IST."""
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
     return now.strftime("%A, %d %B %Y — %I:%M %p IST")
 
-def generate_image(prompt: str) -> str | None:
-    """Call the image generation API and return image URL or None."""
+def generate_image(prompt: str):
     try:
         resp = requests.post(
             f"{IMAGE_API_BASE}{IMAGE_ENDPOINT}",
@@ -95,11 +93,6 @@ def generate_image(prompt: str) -> str | None:
         return None
 
 async def ask_groq(user_id: int, user_message: str):
-    """
-    Returns either:
-      ("text", reply_string)
-      ("image", (caption, image_url))
-    """
     history = get_history(user_id)
     timestamp = get_timestamp()
     stamped_message = f"[{timestamp}]\n{user_message}"
@@ -131,14 +124,14 @@ async def ask_groq(user_id: int, user_message: str):
     ]
 
     try:
-        # First call — may request tool use
         completion = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
-            temperature=1,
-            max_tokens=8192,
+            temperature=0.7,
+            max_completion_tokens=8192,
             top_p=1,
             reasoning_effort="medium",
+            reasoning_format="hidden",
             stream=False,
             stop=None,
             tools=tools,
@@ -147,7 +140,6 @@ async def ask_groq(user_id: int, user_message: str):
 
         message = completion.choices[0].message
 
-        # Check if model wants to call generate_image
         if message.tool_calls:
             for tool_call in message.tool_calls:
                 if tool_call.function.name == "generate_image":
@@ -159,14 +151,13 @@ async def ask_groq(user_id: int, user_message: str):
 
                     if image_url:
                         caption = f"✨ Here you go!\n\n*Prompt used:* _{improved_prompt}_"
-                        history.append({"role": "assistant", "content": f"[Generated image for prompt: {improved_prompt}]"})
+                        history.append({"role": "assistant", "content": f"[Generated image for: {improved_prompt}]"})
                         return ("image", (caption, image_url))
                     else:
-                        reply = "Tried generating that image but something went wrong on the server 😅 Try again in a bit?"
+                        reply = "Tried generating that but the image server threw a fit 😅 Try again in a bit?"
                         history.append({"role": "assistant", "content": reply})
                         return ("text", reply)
 
-        # Normal text reply
         reply = (message.content or "").strip()
         if not reply:
             reply = "Hmm, got nothing back. Try asking again?"
@@ -220,7 +211,6 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     result = await ask_groq(update.effective_user.id, update.message.text)
-
     kind, payload = result
 
     if kind == "image":
@@ -234,7 +224,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for chunk in split_text(payload):
             await update.message.reply_text(chunk, parse_mode="Markdown")
 
-# Keep-alive HTTP server
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
