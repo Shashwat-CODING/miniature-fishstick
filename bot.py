@@ -640,6 +640,33 @@ def generate_image(prompt: str) -> str | None:
         logger.error("Image generation failed: %s", e)
         return None
 
+def escape_md(text: str) -> str:
+    """Escape special characters for Telegram MarkdownV2."""
+    special = r"\_*[]()~`>#+-=|{}.!"
+    return "".join(f"\\{c}" if c in special else c for c in str(text))
+
+def md_to_html(text: str) -> str:
+    """
+    Convert the subset of Markdown the LLM typically produces into Telegram HTML.
+    Handles: **bold**, *bold*, `code`, ```code blocks```, and escapes raw HTML chars.
+    Falls back gracefully — unrecognised syntax is left as plain text.
+    """
+    import re, html
+    # Escape HTML special chars first
+    t = html.escape(text)
+    # ```...``` code blocks
+    t = re.sub(r"```(?:\w+\n)?(.*?)```", lambda m: f"<pre>{m.group(1).strip()}</pre>",
+               t, flags=re.DOTALL)
+    # `inline code`
+    t = re.sub(r"`([^`]+)`", r"<code>\1</code>", t)
+    # **bold** or __bold__
+    t = re.sub(r"\*\*(.+?)\*\*|__(.+?)__", lambda m: f"<b>{m.group(1) or m.group(2)}</b>", t)
+    # *italic* or _italic_ (single, not double)
+    t = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)|(?<!_)_(?!_)(.+?)(?<!_)_(?!_)",
+               lambda m: f"<i>{m.group(1) or m.group(2)}</i>", t)
+    return t
+
+
 def split_text(text: str, max_len: int = 4000) -> list[str]:
     if len(text) <= max_len:
         return [text]
@@ -652,6 +679,7 @@ def split_text(text: str, max_len: int = 4000) -> list[str]:
     if current:
         chunks.append(current)
     return chunks
+
 
 # ─── GROQ CALLS ───────────────────────────────────────────────────────────────
 
@@ -775,10 +803,10 @@ async def ask_groq_group(issue_text: str, context_info: str = "") -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
-    name = update.effective_user.first_name or "there"
+    name = escape_md(update.effective_user.first_name or "there")
     await update.message.reply_text(
-        f"Hey *{name}*! I'm *Yashraj* 👋\nYour AI buddy, made by Shashwat.\n\nAsk me anything — questions, code, roasts, images… whatever.\n\n/help for commands.",
-        parse_mode="Markdown"
+        f"Hey *{name}*\\! I'm *Yashraj* 👋\nYour AI buddy, made by Shashwat\\.\n\nAsk me anything — questions, code, roasts, images… whatever\\.\n\n/help for commands\\.",
+        parse_mode="MarkdownV2"
     )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -791,10 +819,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/clear — Forget our chat\n"
         "/model — Which model I'm running\n"
         "/setowner — Register yourself as the bot owner\n\n"
-        "*Tips*\n"
-        "• Say *'be detailed'* for a longer answer\n"
-        "• Say *'generate an image of...'* and I'll make one 🎨",
-        parse_mode="Markdown"
+        "<b>Tips</b>\n"
+        "• Say <i>'be detailed'</i> for a longer answer\n"
+        "• Say <i>'generate an image of...'</i> and I'll make one 🎨",
+        parse_mode="HTML"
     )
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -806,7 +834,7 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
-    await update.message.reply_text(f"Running `{GROQ_MODEL}` via Groq ⚡", parse_mode="Markdown")
+    await update.message.reply_text(f"Running <code>{GROQ_MODEL}</code> via Groq ⚡", parse_mode="HTML")
 
 async def cmd_setowner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
@@ -819,8 +847,8 @@ async def cmd_setowner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     set_owner_id(user_id)
     await update.message.reply_text(
-        f"✅ You're registered as my owner! I'll DM you about group issues.\nYour ID: `{user_id}`",
-        parse_mode="Markdown"
+        f"✅ You're registered as my owner\\! I'll DM you about group issues\\.\nYour ID: `{user_id}`",
+        parse_mode="MarkdownV2"
     )
     logger.info("Owner set to user ID: %d", user_id)
 
@@ -834,8 +862,9 @@ async def cmd_groupstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         summary = build_group_status(update.effective_chat.id)
     else:
         summary = build_group_status()
+    # Use plain text to avoid Markdown parse errors from user-generated content
     for chunk in split_text(summary):
-        await update.message.reply_text(chunk, parse_mode="Markdown")
+        await update.message.reply_text(chunk)
 
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -847,7 +876,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     if user_id == get_owner_id() and is_owner_group_query(text):
         summary = build_group_status()
         for chunk in split_text(summary):
-            await update.message.reply_text(chunk, parse_mode="Markdown")
+            await update.message.reply_text(chunk)  # plain text — has user content
         return
 
     result = await ask_groq(user_id, text)
@@ -863,7 +892,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 await update.message.reply_photo(photo=image_url)
             except Exception as e:
                 logger.error("Failed to send photo: %s", e)
-                await update.message.reply_text(f"[Image]({image_url})", parse_mode="Markdown")
+                await update.message.reply_text(f"<a href='{image_url}'>Image</a>", parse_mode="HTML")
             history = get_history(user_id)
             history.append({"role": "assistant", "content": "Image generated successfully."})
             save_history(user_id, history)
@@ -874,7 +903,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             save_history(user_id, history)
     else:
         for chunk in split_text(payload):
-            await update.message.reply_text(chunk, parse_mode="Markdown")
+            await update.message.reply_text(md_to_html(chunk), parse_mode="HTML")
 
 
 # ─── GROUP HANDLERS ───────────────────────────────────────────────────────────
@@ -900,11 +929,9 @@ async def on_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        "👋 Hey! I'm *Yashraj*, the Drishya support assistant.\n"
-                        "I'll help with any issues — just ask or tag me @"
-                        f"{context.bot.username} anytime!"
+                        "👋 Hey! I'm Yashraj, the Drishya support assistant.\n"
+                        "I'll help with any issues — just ask or tag me anytime!"
                     ),
-                    parse_mode="Markdown"
                 )
             except Exception as e:
                 logger.warning("Could not greet group %d: %s", chat_id, e)
@@ -941,18 +968,18 @@ async def notify_owner(context: ContextTypes.DEFAULT_TYPE, group_title: str, cha
         logger.warning("Owner ID not set — can't send DM.")
         return
 
+    import html as _html
     type_emoji = {"app": "🔧", "provider": "📦", "config": "⚙️", "general": "ℹ️", "unknown": "❓"}
     emoji = type_emoji.get(issue_type, "❓")
 
     msg = (
-        f"{emoji} *New issue in group: {group_title}*\n\n"
-        f"👤 User: {user_name}\n"
-        f"📝 Issue: {issue_text}\n"
-        f"🏷 Type: `{issue_type}`\n\n"
-        f"[Go to group](tg://openmessage?chat_id={str(chat_id).replace('-100', '')})"
+        f"{emoji} <b>New issue in group: {_html.escape(group_title)}</b>\n\n"
+        f"👤 User: {_html.escape(user_name)}\n"
+        f"📝 Issue: {_html.escape(issue_text)}\n"
+        f"🏷 Type: <code>{_html.escape(issue_type)}</code>"
     )
     try:
-        await context.bot.send_message(chat_id=owner_id, text=msg, parse_mode="Markdown")
+        await context.bot.send_message(chat_id=owner_id, text=msg, parse_mode="HTML")
         logger.info("Notified owner about issue in group %s", group_title)
     except Exception as e:
         logger.error("Failed to DM owner: %s", e)
@@ -991,9 +1018,9 @@ async def delayed_group_response(
     try:
         await context.bot.send_message(
             chat_id=chat_id,
-            text=reply,
+            text=md_to_html(reply),
             reply_to_message_id=message_id,
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     except Exception as e:
         logger.error("Failed to send group reply: %s", e)
@@ -1043,12 +1070,12 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 try:
                     await msg.reply_photo(photo=image_url)
                 except Exception:
-                    await msg.reply_text(f"[Image]({image_url})", parse_mode="Markdown")
+                    await msg.reply_text(f"<a href='{image_url}'>Image</a>", parse_mode="HTML")
             else:
                 await msg.reply_text("Image server threw a fit 😅")
         else:
             for chunk in split_text(payload):
-                await msg.reply_text(chunk, parse_mode="Markdown")
+                await msg.reply_text(md_to_html(chunk), parse_mode="HTML")
 
         if in_drishya_group:
             db.resolve_issue(chat_id, f"{message_id}")
@@ -1087,6 +1114,48 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.info("Auto-resolved open issues based on reply: %s", text[:60])
 
     # ── Case 4: Pure chatter — do nothing ────────────────────────────────────
+
+
+async def on_user_joined(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Greet new members who join any group the bot is in."""
+    result = update.chat_member
+    if not result:
+        return
+
+    chat      = result.chat
+    new_member = result.new_chat_member
+    old_status = result.old_chat_member.status
+    new_status = new_member.status
+
+    # Only fire when someone transitions into the group (not on role changes)
+    if old_status in ("member", "administrator", "creator") or new_status not in ("member",):
+        return
+
+    user      = new_member.user
+    if user.is_bot:
+        return  # Don't greet bots
+
+    chat_title = chat.title or ""
+    chat_uname = (chat.username or "").lower()
+    first_name = user.first_name or user.username or "there"
+
+    if is_drishya_group(chat_title, chat_uname):
+        # Drishya support group — welcome with app context
+        text = (
+            f"👋 Welcome, {first_name}!\n\n"
+            f"This is the Drishya support group. If you run into any issues with the app, "
+            f"just describe them here and we'll help you out.\n\n"
+            f"🌐 Website: https://driishya.netlify.app\n"
+            f"📥 Download: https://driishya.netlify.app/download"
+        )
+    else:
+        # Generic group
+        text = f"👋 Welcome, {first_name}! Glad to have you here 🎉"
+
+    try:
+        await context.bot.send_message(chat_id=chat.id, text=text)
+    except Exception as e:
+        logger.warning("Could not greet new member in group %d: %s", chat.id, e)
 
 
 # ─── HTTP HEALTH SERVER ───────────────────────────────────────────────────────
@@ -1140,6 +1209,7 @@ def main():
     )
 
     app.add_handler(ChatMemberHandler(on_bot_added, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(on_user_joined, ChatMemberHandler.CHAT_MEMBER))
 
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("help",        cmd_help))
