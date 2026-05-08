@@ -8,7 +8,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, BotCommand
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ChatMemberHandler, ContextTypes, filters
 from groq import Groq
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
@@ -39,7 +39,9 @@ OWNER_USER_ID   = None          # Set via /setowner command, or hardcode your Te
 OWNER_USER_ID_HARDCODED = None  # <- hardcode your numeric Telegram ID here if you want e.g. 123456789
 
 # ── Group config ──────────────────────────────────────────────────────────────
-GROUP_NAME      = "drishya"     # The bot monitors groups with this name (case-insensitive partial match)
+# Match groups by title keyword OR username. Add more to either list as needed.
+GROUP_NAME_KEYWORDS = ["drishya"]          # matched against chat title (case-insensitive)
+GROUP_USERNAMES     = ["drishyapp", "drishya"]  # matched against chat username (case-insensitive)
 # How long (seconds) to wait before stepping in on an unresolved issue in a group
 ISSUE_WAIT_SECS = 180           # 3 minutes
 
@@ -251,6 +253,11 @@ known_groups:    dict[int, str] = {}
 # Resolved issue message IDs (to avoid double-responding)
 resolved_msgs:   set = set()
 
+# Rolling buffer: last N messages seen in each group (for owner status queries)
+# { chat_id: [ {"user": str, "text": str, "time": float, "time_str": str}, ... ] }
+recent_group_msgs: dict[int, list[dict]] = {}
+MAX_RECENT_MSGS = 40  # keep last 40 messages per group
+
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 def get_history(user_id: int) -> list:
@@ -263,8 +270,103 @@ def get_timestamp() -> str:
 def get_owner_id() -> int | None:
     return OWNER_USER_ID or OWNER_USER_ID_HARDCODED
 
-def is_drishya_group(chat_title: str) -> bool:
-    return GROUP_NAME.lower() in (chat_title or "").lower()
+def is_drishya_group(chat_title: str, chat_username: str = "") -> bool:
+    """Match by title keyword OR by username — whichever applies."""
+    title_l    = (chat_title    or "").lower()
+    username_l = (chat_username or "").lower()
+    title_match    = any(kw in title_l    for kw in GROUP_NAME_KEYWORDS)
+    username_match = any(un in username_l for un in GROUP_USERNAMES)
+    return title_match or username_match
+
+def record_group_message(chat_id: int, user_name: str, text: str):
+    """Store a message in the rolling buffer for this group."""
+    buf = recent_group_msgs.setdefault(chat_id, [])
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    buf.append({
+        "user":     user_name,
+        "text":     text,
+        "time":     now.timestamp(),
+        "time_str": now.strftime("%I:%M %p"),
+    })
+    if len(buf) > MAX_RECENT_MSGS:
+        recent_group_msgs[chat_id] = buf[-MAX_RECENT_MSGS:]
+
+def build_group_status(chat_id: int | None = None) -> str:
+    """
+    Build a plain-text summary of group activity for the owner.
+    If chat_id is given, summarise just that group; otherwise all known groups.
+    """
+    def _summarise_one(cid: int, title: str) -> str:
+        msgs  = recent_group_msgs.get(cid, [])
+        issues = group_issues.get(cid, {})
+        open_issues   = [v for v in issues.values() if not v.get("resolved")]
+        closed_issues = [v for v in issues.values() if v.get("resolved")]
+
+        lines = [f"📍 *{title}*"]
+
+        if open_issues:
+            lines.append(f"🔴 *{len(open_issues)} open issue(s):*")
+            for iss in open_issues[-5:]:   # show latest 5
+                lines.append(f"  • [{iss['time_str'] if 'time_str' in iss else '?'}] {iss['user']}: {iss['text'][:80]}")
+        else:
+            lines.append("✅ No open issues right now.")
+
+        if closed_issues:
+            lines.append(f"✔️ {len(closed_issues)} resolved issue(s) this session.")
+
+        if msgs:
+            lines.append(f"\n💬 *Last {min(10, len(msgs))} messages:*")
+            for m in msgs[-10:]:
+                lines.append(f"  [{m['time_str']}] *{m['user']}*: {m['text'][:80]}")
+        else:
+            lines.append("\n_(No messages recorded yet — bot just started or group is quiet)_")
+
+        return "\n".join(lines)
+
+    if chat_id:
+        info  = known_groups.get(chat_id, {})
+        title = info.get("title", f"Group {chat_id}")
+        return _summarise_one(chat_id, title)
+
+    if not known_groups:
+        return (
+            "I haven't seen any group activity yet since I started up.\n"
+            "Make sure I'm in the group and privacy mode is OFF in BotFather."
+        )
+
+    parts = []
+    for cid, info in known_groups.items():
+        title    = info.get("title", "")
+        username = info.get("username", "")
+        if is_drishya_group(title, username):
+            parts.append(_summarise_one(cid, title or username or str(cid)))
+    if not parts:
+        # Show ALL known groups so owner can see what the bot actually joined
+        all_groups = "\n".join(
+            f"  • {v.get('title','?')} (@{v.get('username','?')})"
+            for v in known_groups.values()
+        )
+        return (
+            f"I'm not detecting any Drishya groups yet.\n\n"
+            f"Groups I can currently see:\n{all_groups or '  (none yet)'}\n\n"
+            f"If your group is listed above but not matching, I'll auto-detect it — "
+            f"just send any message in the group and ask me again."
+        )
+    return "\n\n─────────────\n\n".join(parts)
+
+
+def is_owner_group_query(text: str) -> bool:
+    """Detect when the owner is asking about group activity."""
+    t = text.lower()
+    group_refs = ["group", "drishya", "grp"]
+    query_refs = ["what's going on", "whats going on", "what is going on",
+                  "what's happening", "whats happening", "what happened",
+                  "status", "update", "activity", "issues", "any issue",
+                  "anything", "tell me", "show me", "summary", "report",
+                  "going on", "happing", "happening", "messages"]
+    has_group = any(w in t for w in group_refs)
+    has_query = any(w in t for w in query_refs)
+    return has_group and has_query
 
 def classify_issue(text: str) -> str:
     """
@@ -503,10 +605,37 @@ async def cmd_setowner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Owner set to user ID: %d", OWNER_USER_ID)
 
 
+async def cmd_groupstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only command: show live group activity summary."""
+    user_id = update.effective_user.id
+    # Allow from private chat or from inside a group (for convenience)
+    if user_id != get_owner_id():
+        await update.message.reply_text("This command is for the owner only 🔒")
+        return
+    # If run inside a specific group, summarise just that group
+    if update.effective_chat.type in ("group", "supergroup"):
+        summary = build_group_status(update.effective_chat.id)
+    else:
+        summary = build_group_status()
+    for chunk in split_text(summary):
+        await update.message.reply_text(chunk, parse_mode="Markdown")
+
+
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle DMs — full AI assistant mode."""
+    """Handle DMs — full AI assistant mode, with owner group-status shortcut."""
+    user_id = update.effective_user.id
+    text    = update.message.text or ""
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    result = await ask_groq(update.effective_user.id, update.message.text)
+
+    # ── Owner asking about group activity → answer from live state ────────────
+    if user_id == get_owner_id() and is_owner_group_query(text):
+        summary = build_group_status()
+        for chunk in split_text(summary):
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+        return
+
+    result = await ask_groq(user_id, text)
     kind, payload = result
 
     if kind == "image_pending":
@@ -520,12 +649,12 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             except Exception as e:
                 logger.error("Failed to send photo: %s", e)
                 await update.message.reply_text(f"[Image]({image_url})", parse_mode="Markdown")
-            get_history(update.effective_user.id).append({
+            get_history(user_id).append({
                 "role": "assistant", "content": "Image generated successfully."
             })
         else:
             await update.message.reply_text("Image server threw a fit 😅 Try again in a bit?")
-            get_history(update.effective_user.id).append({
+            get_history(user_id).append({
                 "role": "assistant", "content": "Image generation failed."
             })
     else:
@@ -534,6 +663,48 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
 
 # ─── GROUP HANDLERS ───────────────────────────────────────────────────────────
+
+async def on_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Fires when the bot's membership status changes in any chat.
+    Used to register groups the moment the bot is added — before any messages.
+    """
+    result = update.my_chat_member
+    if not result:
+        return
+    chat = result.chat
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    new_status = result.new_chat_member.status
+    chat_title = chat.title or ""
+    chat_uname = (chat.username or "").lower()
+    chat_id    = chat.id
+
+    if new_status in ("member", "administrator"):
+        known_groups[chat_id] = {"title": chat_title, "username": chat_uname}
+        logger.info(
+            "Bot added to group: '%s' (@%s) id=%d status=%s",
+            chat_title, chat_uname, chat_id, new_status
+        )
+        # Greet the group so users know the bot is active
+        if is_drishya_group(chat_title, chat_uname):
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "👋 Hey! I'm *Yashraj*, the Drishya support assistant.\n"
+                        "I'll help with any issues — just ask or tag me @"
+                        f"{context.bot.username} anytime!"
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.warning("Could not greet group %d: %s", chat_id, e)
+
+    elif new_status in ("left", "kicked"):
+        known_groups.pop(chat_id, None)
+        logger.info("Bot removed from group '%s' id=%d", chat_title, chat_id)
 
 def is_bot_mentioned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Check if the bot was @mentioned or replied to in the message."""
@@ -655,18 +826,21 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if not msg or not msg.text:
         return
 
-    chat_id    = update.effective_chat.id
-    chat_title = update.effective_chat.title or ""
+    chat       = update.effective_chat
+    chat_id    = chat.id
+    chat_title = chat.title or ""
+    chat_uname = (chat.username or "").lower()
     user       = update.effective_user
     user_name  = user.first_name or user.username or "Someone"
     message_id = msg.message_id
     text       = msg.text.strip()
 
-    # Register group
-    known_groups[chat_id] = chat_title
+    # Register group (store both title and username for reliable matching)
+    known_groups[chat_id] = {"title": chat_title, "username": chat_uname}
+    record_group_message(chat_id, user_name, text)
 
-    # Only handle Drishya groups for support logic
-    in_drishya_group = is_drishya_group(chat_title)
+    # Detect if this is the Drishya support group
+    in_drishya_group = is_drishya_group(chat_title, chat_uname)
 
     mentioned = is_bot_mentioned(update, context)
 
@@ -712,11 +886,13 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if chat_id not in group_issues:
             group_issues[chat_id] = {}
 
+        now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
         group_issues[chat_id][issue_key] = {
             "message_id": message_id,
             "text":       text,
             "user":       user_name,
             "time":       time.time(),
+            "time_str":   now_ist.strftime("%I:%M %p"),
             "resolved":   False,
         }
         logger.info("Issue tracked in group '%s': %s", chat_title, text[:80])
@@ -775,13 +951,13 @@ def keep_alive():
 
 async def post_init(app):
     await app.bot.set_my_commands([
-        BotCommand("start",    "Say hi"),
-        BotCommand("help",     "Show commands"),
-        BotCommand("clear",    "Clear history"),
-        BotCommand("model",    "Active model"),
-        BotCommand("setowner", "Register as owner (private chat only)"),
+        BotCommand("start",       "Say hi"),
+        BotCommand("help",        "Show commands"),
+        BotCommand("clear",       "Clear history"),
+        BotCommand("model",       "Active model"),
+        BotCommand("setowner",    "Register as owner (private chat only)"),
+        BotCommand("groupstatus", "Show live group activity (owner only)"),
     ])
-    # Allow bot to receive all group messages (not just commands)
     logger.info("Bot commands set.")
 
 
@@ -796,12 +972,16 @@ def main():
         .build()
     )
 
+    # ── Membership tracking (fires when bot is added/removed from groups) ─────
+    app.add_handler(ChatMemberHandler(on_bot_added, ChatMemberHandler.MY_CHAT_MEMBER))
+
     # ── Private chat handlers ──────────────────────────────────────────────
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("help",     cmd_help))
-    app.add_handler(CommandHandler("clear",    cmd_clear))
-    app.add_handler(CommandHandler("model",    cmd_model))
-    app.add_handler(CommandHandler("setowner", cmd_setowner))
+    app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("help",        cmd_help))
+    app.add_handler(CommandHandler("clear",       cmd_clear))
+    app.add_handler(CommandHandler("model",       cmd_model))
+    app.add_handler(CommandHandler("setowner",    cmd_setowner))
+    app.add_handler(CommandHandler("groupstatus", cmd_groupstatus))
 
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
@@ -809,6 +989,7 @@ def main():
     ))
 
     # ── Group handlers ────────────────────────────────────────────────────
+    app.add_handler(CommandHandler("groupstatus", cmd_groupstatus))  # works in-group too
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
         handle_group_message
