@@ -10,6 +10,9 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ChatMemberHandler, ContextTypes, filters
 from groq import Groq
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import psycopg2.pool
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,26 +27,26 @@ MAX_HISTORY    = 10
 RENDER_URL     = "https://miniature-fishstick-9xmr.onrender.com"
 PORT           = 8080
 
+DATABASE_URL = (
+    "postgresql://neondb_owner:npg_Ehns1Q4WHmOl"
+    "@ep-restless-cloud-aojiqp0s-pooler.c-2.ap-southeast-1.aws.neon.tech"
+    "/neondb?sslmode=require&channel_binding=require"
+)
+
 # ── Groq API keys (failover pool) ─────────────────────────────────────────────
-# Add as many keys as you want. Bot auto-switches on error and re-tests failed keys.
 GROQ_API_KEYS = [
     "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",
     "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",
-    "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",
 ]
-# How long (seconds) to wait before retrying a failed key
-KEY_RETRY_SECS = 120  # 2 minutes
+KEY_RETRY_SECS = 120
 
 # ── Owner config ──────────────────────────────────────────────────────────────
-OWNER_USER_ID   = None          # Set via /setowner command, or hardcode your Telegram user ID here e.g. 123456789
-OWNER_USER_ID_HARDCODED = None  # <- hardcode your numeric Telegram ID here if you want e.g. 123456789
+OWNER_USER_ID_HARDCODED = None  # <- hardcode your numeric Telegram ID here if desired
 
 # ── Group config ──────────────────────────────────────────────────────────────
-# Match groups by title keyword OR username. Add more to either list as needed.
-GROUP_NAME_KEYWORDS = ["drishya"]          # matched against chat title (case-insensitive)
-GROUP_USERNAMES     = ["drishyapp", "drishya"]  # matched against chat username (case-insensitive)
-# How long (seconds) to wait before stepping in on an unresolved issue in a group
-ISSUE_WAIT_SECS = 180           # 3 minutes
+GROUP_NAME_KEYWORDS = ["drishya"]
+GROUP_USERNAMES     = ["drishyapp", "drishya"]
+ISSUE_WAIT_SECS = 180
 
 # ── Drishya app info ───────────────────────────────────────────────────────────
 DRISHYA_INFO = {
@@ -57,68 +60,325 @@ DRISHYA_INFO = {
     ),
 }
 
+# ─── DATABASE LAYER ──────────────────────────────────────────────────────────
+
+class Database:
+    """
+    Thin wrapper around a psycopg2 connection pool.
+    All bot state is stored here so it survives redeploys.
+    """
+
+    def __init__(self, dsn: str):
+        self._pool = psycopg2.pool.ThreadedConnectionPool(1, 10, dsn)
+        self._init_schema()
+        logger.info("Database connected and schema initialised.")
+
+    # ── Connection helper ──────────────────────────────────────────────────────
+
+    def _conn(self):
+        return self._pool.getconn()
+
+    def _put(self, conn):
+        self._pool.putconn(conn)
+
+    # ── Schema ─────────────────────────────────────────────────────────────────
+
+    def _init_schema(self):
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_config (
+                        key   TEXT PRIMARY KEY,
+                        value TEXT
+                    );
+
+                    CREATE TABLE IF NOT EXISTS user_histories (
+                        user_id  BIGINT PRIMARY KEY,
+                        history  JSONB  NOT NULL DEFAULT '[]'
+                    );
+
+                    CREATE TABLE IF NOT EXISTS known_groups (
+                        chat_id  BIGINT PRIMARY KEY,
+                        title    TEXT,
+                        username TEXT
+                    );
+
+                    CREATE TABLE IF NOT EXISTS group_issues (
+                        chat_id     BIGINT,
+                        issue_key   TEXT,
+                        message_id  BIGINT,
+                        text        TEXT,
+                        user_name   TEXT,
+                        created_at  DOUBLE PRECISION,
+                        time_str    TEXT,
+                        resolved    BOOLEAN DEFAULT FALSE,
+                        PRIMARY KEY (chat_id, issue_key)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS recent_group_msgs (
+                        id        BIGSERIAL PRIMARY KEY,
+                        chat_id   BIGINT,
+                        user_name TEXT,
+                        text      TEXT,
+                        created_at DOUBLE PRECISION,
+                        time_str   TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_rgm_chat_id ON recent_group_msgs (chat_id);
+                """)
+            conn.commit()
+        finally:
+            self._put(conn)
+
+    # ── bot_config (key/value store for simple scalars) ───────────────────────
+
+    def get_config(self, key: str) -> str | None:
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM bot_config WHERE key = %s", (key,))
+                row = cur.fetchone()
+                return row[0] if row else None
+        finally:
+            self._put(conn)
+
+    def set_config(self, key: str, value: str):
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO bot_config (key, value) VALUES (%s, %s)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """, (key, str(value)))
+            conn.commit()
+        finally:
+            self._put(conn)
+
+    # ── User histories ────────────────────────────────────────────────────────
+
+    def get_history(self, user_id: int) -> list:
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT history FROM user_histories WHERE user_id = %s", (user_id,))
+                row = cur.fetchone()
+                return row[0] if row else []
+        finally:
+            self._put(conn)
+
+    def save_history(self, user_id: int, history: list):
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO user_histories (user_id, history) VALUES (%s, %s::jsonb)
+                    ON CONFLICT (user_id) DO UPDATE SET history = EXCLUDED.history
+                """, (user_id, json.dumps(history)))
+            conn.commit()
+        finally:
+            self._put(conn)
+
+    def clear_history(self, user_id: int):
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM user_histories WHERE user_id = %s", (user_id,))
+            conn.commit()
+        finally:
+            self._put(conn)
+
+    # ── Known groups ──────────────────────────────────────────────────────────
+
+    def upsert_group(self, chat_id: int, title: str, username: str):
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO known_groups (chat_id, title, username) VALUES (%s, %s, %s)
+                    ON CONFLICT (chat_id) DO UPDATE SET title = EXCLUDED.title, username = EXCLUDED.username
+                """, (chat_id, title, username))
+            conn.commit()
+        finally:
+            self._put(conn)
+
+    def remove_group(self, chat_id: int):
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM known_groups WHERE chat_id = %s", (chat_id,))
+            conn.commit()
+        finally:
+            self._put(conn)
+
+    def all_groups(self) -> dict:
+        """Returns {chat_id: {"title": ..., "username": ...}}"""
+        conn = self._conn()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT chat_id, title, username FROM known_groups")
+                return {row["chat_id"]: {"title": row["title"], "username": row["username"]}
+                        for row in cur.fetchall()}
+        finally:
+            self._put(conn)
+
+    # ── Group issues ──────────────────────────────────────────────────────────
+
+    def upsert_issue(self, chat_id: int, issue_key: str, message_id: int,
+                     text: str, user_name: str, created_at: float,
+                     time_str: str, resolved: bool = False):
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO group_issues
+                        (chat_id, issue_key, message_id, text, user_name, created_at, time_str, resolved)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (chat_id, issue_key) DO UPDATE
+                        SET resolved = EXCLUDED.resolved
+                """, (chat_id, issue_key, message_id, text, user_name, created_at, time_str, resolved))
+            conn.commit()
+        finally:
+            self._put(conn)
+
+    def resolve_issue(self, chat_id: int, issue_key: str):
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE group_issues SET resolved = TRUE
+                    WHERE chat_id = %s AND issue_key = %s
+                """, (chat_id, issue_key))
+            conn.commit()
+        finally:
+            self._put(conn)
+
+    def get_issues(self, chat_id: int) -> dict:
+        """Returns {issue_key: {…}} for the given chat."""
+        conn = self._conn()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT issue_key, message_id, text, user_name, created_at, time_str, resolved
+                    FROM group_issues WHERE chat_id = %s
+                    ORDER BY created_at DESC LIMIT 100
+                """, (chat_id,))
+                return {
+                    row["issue_key"]: {
+                        "message_id": row["message_id"],
+                        "text":       row["text"],
+                        "user":       row["user_name"],
+                        "time":       row["created_at"],
+                        "time_str":   row["time_str"],
+                        "resolved":   row["resolved"],
+                    }
+                    for row in cur.fetchall()
+                }
+        finally:
+            self._put(conn)
+
+    def resolve_recent_issues(self, chat_id: int, within_secs: float):
+        """Mark all unresolved issues younger than within_secs as resolved."""
+        conn = self._conn()
+        cutoff = time.time() - within_secs
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE group_issues SET resolved = TRUE
+                    WHERE chat_id = %s AND resolved = FALSE AND created_at > %s
+                """, (chat_id, cutoff))
+            conn.commit()
+        finally:
+            self._put(conn)
+
+    # ── Recent group messages ─────────────────────────────────────────────────
+
+    def add_group_msg(self, chat_id: int, user_name: str, text: str,
+                      created_at: float, time_str: str):
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO recent_group_msgs (chat_id, user_name, text, created_at, time_str)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (chat_id, user_name, text, created_at, time_str))
+                # Prune to last 40 per chat_id
+                cur.execute("""
+                    DELETE FROM recent_group_msgs
+                    WHERE chat_id = %s AND id NOT IN (
+                        SELECT id FROM recent_group_msgs
+                        WHERE chat_id = %s ORDER BY id DESC LIMIT 40
+                    )
+                """, (chat_id, chat_id))
+            conn.commit()
+        finally:
+            self._put(conn)
+
+    def get_group_msgs(self, chat_id: int, limit: int = 40) -> list:
+        conn = self._conn()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT user_name, text, created_at, time_str
+                    FROM recent_group_msgs WHERE chat_id = %s
+                    ORDER BY id DESC LIMIT %s
+                """, (chat_id, limit))
+                rows = cur.fetchall()
+                # Return oldest-first
+                return [
+                    {"user": r["user_name"], "text": r["text"],
+                     "time": r["created_at"], "time_str": r["time_str"]}
+                    for r in reversed(rows)
+                ]
+        finally:
+            self._put(conn)
+
+
+# Instantiate global DB
+db = Database(DATABASE_URL)
+
+
 # ─── GROQ KEY MANAGER ────────────────────────────────────────────────────────
 
 class GroqKeyManager:
-    """
-    Manages a pool of Groq API keys with automatic failover and recovery.
-
-    - Always tries the current active key first.
-    - On any API error, marks that key failed and immediately rotates to the
-      next healthy key, so the next request uses a working key.
-    - Background thread re-tests failed keys every KEY_RETRY_SECS; if a key
-      recovers it's silently put back into rotation.
-    """
-
     def __init__(self, keys: list[str], retry_secs: int = 120):
         if not keys:
             raise ValueError("Must provide at least one Groq API key.")
         self._keys       = list(keys)
         self._retry_secs = retry_secs
-        self._failed_at: dict[str, float] = {}   # key -> epoch of failure
+        self._failed_at: dict[str, float] = {}
         self._active_idx = 0
         self._lock       = threading.Lock()
         self._clients: dict[str, Groq] = {k: Groq(api_key=k) for k in keys}
         logger.info("GroqKeyManager ready with %d key(s).", len(keys))
         threading.Thread(target=self._recovery_loop, daemon=True).start()
 
-    # ── Public ────────────────────────────────────────────────────────────────
-
     @property
     def client(self) -> Groq:
-        """Groq client for the current active key."""
         return self._clients[self._current_key]
 
     def current_key(self) -> str:
         return self._current_key
 
     def mark_failed(self, key: str):
-        """Call this when a key throws an error. Always records failure and rotates."""
         with self._lock:
-            self._failed_at[key] = time.time()   # always refresh timestamp
+            self._failed_at[key] = time.time()
             logger.warning("Groq key ...%s marked failed, rotating now.", key[-6:])
             self._rotate()
-
-    # ── Internal ──────────────────────────────────────────────────────────────
 
     @property
     def _current_key(self) -> str:
         return self._keys[self._active_idx]
 
     def _healthy_keys(self) -> list[str]:
-        """Keys not currently marked as failed (regardless of retry window)."""
         return [k for k in self._keys if k not in self._failed_at]
 
     def _rotate(self):
-        """Pick the next healthy key (must be called inside self._lock)."""
         healthy = self._healthy_keys()
         if not healthy:
             logger.error("ALL Groq keys failing — using least-recently-failed as fallback.")
             fallback = min(self._failed_at, key=lambda k: self._failed_at[k])
             self._active_idx = self._keys.index(fallback)
-            logger.info("Fallback to Groq key ...%s", fallback[-6:])
             return
-        # Prefer a key that isn't the current one
         current = self._current_key
         candidates = [k for k in healthy if k != current] or healthy
         chosen = candidates[0]
@@ -126,7 +386,6 @@ class GroqKeyManager:
         logger.info("Rotated to Groq key ...%s", chosen[-6:])
 
     def _probe(self, key: str) -> bool:
-        """Tiny test call to see if a key is working again."""
         try:
             self._clients[key].chat.completions.create(
                 model=GROQ_MODEL,
@@ -139,25 +398,22 @@ class GroqKeyManager:
             return False
 
     def _recovery_loop(self):
-        """Background: probe failed keys every retry window."""
         while True:
             time.sleep(self._retry_secs)
             with self._lock:
                 recovered = []
                 for key, ts in list(self._failed_at.items()):
                     if time.time() - ts < self._retry_secs:
-                        continue   # not ready to retry yet
+                        continue
                     logger.info("Probing Groq key ...%s for recovery…", key[-6:])
                     if self._probe(key):
                         recovered.append(key)
                         logger.info("Groq key ...%s recovered ✅", key[-6:])
                     else:
-                        self._failed_at[key] = time.time()   # reset retry timer
+                        self._failed_at[key] = time.time()
                         logger.info("Groq key ...%s still failing ❌", key[-6:])
                 for key in recovered:
                     del self._failed_at[key]
-                # If current active key just recovered-or-was-already-healthy, stay put
-                # If it's still failed, rotate to something healthy
                 if self._current_key in self._failed_at:
                     self._rotate()
 
@@ -225,53 +481,43 @@ Drishya is an app for watching movies, series, music, live TV, mini games, and a
 
 ## Issue classification
 When a user reports an issue, classify it:
-1. **App/backend issue** (e.g. app crashes, video not loading, buffering, UI bug) → These are Drishya app/backend problems. Acknowledge, say the owner has been notified, and ask them to wait.
-2. **Provider/content issue** (e.g. a dub not available, missing episodes, wrong subtitles) → These are provider-side. Tell the user you'll try to fix it but it depends on the provider.
-3. **Config/setup issue** (e.g. can't configure, settings not working) → Direct them to https://driishya.netlify.app/config
-4. **General question** (e.g. platforms, how to download) → Answer helpfully with app info.
+1. **App/backend issue** → Acknowledge, say the owner has been notified, ask them to wait.
+2. **Provider/content issue** → Tell the user you'll try to fix it but it depends on the provider.
+3. **Config/setup issue** → Direct them to https://driishya.netlify.app/config
+4. **General question** → Answer helpfully with app info.
 
 ## When you don't know the fix
-If an issue is unclear or you don't have enough info to resolve it, say:
-"I've let the owner know about this — they'll look into it soon! 🙏"
+Say: "I've let the owner know about this — they'll look into it soon! 🙏"
 
 ## Personality
-- Friendly, calm, helpful. No drama.
-- Short replies. No essays.
+- Friendly, calm, helpful. No drama. Short replies. No essays.
 - Don't respond to casual off-topic chatter between users.
 """
 
-# ─── STATE ────────────────────────────────────────────────────────────────────
+# ─── OWNER ID (DB-backed) ─────────────────────────────────────────────────────
 
-user_histories:  dict[int, list[dict]] = {}
+def get_owner_id() -> int | None:
+    raw = db.get_config("owner_user_id")
+    if raw:
+        return int(raw)
+    return OWNER_USER_ID_HARDCODED
 
-# Tracks unresolved issues per group: { chat_id: { "message_id": int, "text": str, "user": str, "time": float, "resolved": bool } }
-group_issues:    dict[int, dict] = {}
-
-# Tracks which groups this bot is in (chat_id -> chat_title)
-known_groups:    dict[int, str] = {}
-
-# Resolved issue message IDs (to avoid double-responding)
-resolved_msgs:   set = set()
-
-# Rolling buffer: last N messages seen in each group (for owner status queries)
-# { chat_id: [ {"user": str, "text": str, "time": float, "time_str": str}, ... ] }
-recent_group_msgs: dict[int, list[dict]] = {}
-MAX_RECENT_MSGS = 40  # keep last 40 messages per group
+def set_owner_id(uid: int):
+    db.set_config("owner_user_id", str(uid))
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 def get_history(user_id: int) -> list:
-    return user_histories.setdefault(user_id, [])
+    return db.get_history(user_id)
+
+def save_history(user_id: int, history: list):
+    db.save_history(user_id, history)
 
 def get_timestamp() -> str:
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
     return now.strftime("%A, %d %B %Y — %I:%M %p IST")
 
-def get_owner_id() -> int | None:
-    return OWNER_USER_ID or OWNER_USER_ID_HARDCODED
-
 def is_drishya_group(chat_title: str, chat_username: str = "") -> bool:
-    """Match by title keyword OR by username — whichever applies."""
     title_l    = (chat_title    or "").lower()
     username_l = (chat_username or "").lower()
     title_match    = any(kw in title_l    for kw in GROUP_NAME_KEYWORDS)
@@ -279,26 +525,15 @@ def is_drishya_group(chat_title: str, chat_username: str = "") -> bool:
     return title_match or username_match
 
 def record_group_message(chat_id: int, user_name: str, text: str):
-    """Store a message in the rolling buffer for this group."""
-    buf = recent_group_msgs.setdefault(chat_id, [])
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
-    buf.append({
-        "user":     user_name,
-        "text":     text,
-        "time":     now.timestamp(),
-        "time_str": now.strftime("%I:%M %p"),
-    })
-    if len(buf) > MAX_RECENT_MSGS:
-        recent_group_msgs[chat_id] = buf[-MAX_RECENT_MSGS:]
+    db.add_group_msg(chat_id, user_name, text, now.timestamp(), now.strftime("%I:%M %p"))
 
 def build_group_status(chat_id: int | None = None) -> str:
-    """
-    Build a plain-text summary of group activity for the owner.
-    If chat_id is given, summarise just that group; otherwise all known groups.
-    """
+    known_groups = db.all_groups()
+
     def _summarise_one(cid: int, title: str) -> str:
-        msgs  = recent_group_msgs.get(cid, [])
-        issues = group_issues.get(cid, {})
+        msgs   = db.get_group_msgs(cid, limit=10)
+        issues = db.get_issues(cid)
         open_issues   = [v for v in issues.values() if not v.get("resolved")]
         closed_issues = [v for v in issues.values() if v.get("resolved")]
 
@@ -306,8 +541,8 @@ def build_group_status(chat_id: int | None = None) -> str:
 
         if open_issues:
             lines.append(f"🔴 *{len(open_issues)} open issue(s):*")
-            for iss in open_issues[-5:]:   # show latest 5
-                lines.append(f"  • [{iss['time_str'] if 'time_str' in iss else '?'}] {iss['user']}: {iss['text'][:80]}")
+            for iss in open_issues[-5:]:
+                lines.append(f"  • [{iss.get('time_str', '?')}] {iss['user']}: {iss['text'][:80]}")
         else:
             lines.append("✅ No open issues right now.")
 
@@ -315,11 +550,11 @@ def build_group_status(chat_id: int | None = None) -> str:
             lines.append(f"✔️ {len(closed_issues)} resolved issue(s) this session.")
 
         if msgs:
-            lines.append(f"\n💬 *Last {min(10, len(msgs))} messages:*")
-            for m in msgs[-10:]:
+            lines.append(f"\n💬 *Last {len(msgs)} messages:*")
+            for m in msgs:
                 lines.append(f"  [{m['time_str']}] *{m['user']}*: {m['text'][:80]}")
         else:
-            lines.append("\n_(No messages recorded yet — bot just started or group is quiet)_")
+            lines.append("\n_(No messages recorded yet)_")
 
         return "\n".join(lines)
 
@@ -340,39 +575,31 @@ def build_group_status(chat_id: int | None = None) -> str:
         username = info.get("username", "")
         if is_drishya_group(title, username):
             parts.append(_summarise_one(cid, title or username or str(cid)))
+
     if not parts:
-        # Show ALL known groups so owner can see what the bot actually joined
         all_groups = "\n".join(
             f"  • {v.get('title','?')} (@{v.get('username','?')})"
             for v in known_groups.values()
         )
         return (
             f"I'm not detecting any Drishya groups yet.\n\n"
-            f"Groups I can currently see:\n{all_groups or '  (none yet)'}\n\n"
-            f"If your group is listed above but not matching, I'll auto-detect it — "
-            f"just send any message in the group and ask me again."
+            f"Groups I can see:\n{all_groups or '  (none yet)'}\n\n"
+            f"If your group is listed but not matching, send any message in it and ask again."
         )
     return "\n\n─────────────\n\n".join(parts)
 
 
 def is_owner_group_query(text: str) -> bool:
-    """Detect when the owner is asking about group activity."""
     t = text.lower()
     group_refs = ["group", "drishya", "grp"]
     query_refs = ["what's going on", "whats going on", "what is going on",
                   "what's happening", "whats happening", "what happened",
                   "status", "update", "activity", "issues", "any issue",
                   "anything", "tell me", "show me", "summary", "report",
-                  "going on", "happing", "happening", "messages"]
-    has_group = any(w in t for w in group_refs)
-    has_query = any(w in t for w in query_refs)
-    return has_group and has_query
+                  "going on", "happening", "messages"]
+    return any(w in t for w in group_refs) and any(w in t for w in query_refs)
 
 def classify_issue(text: str) -> str:
-    """
-    Quick keyword-based pre-classification to help the LLM and for owner DMs.
-    Returns: 'app', 'provider', 'config', 'general', or 'unknown'
-    """
     text_l = text.lower()
     if any(k in text_l for k in ["crash", "not loading", "not playing", "buffering", "black screen",
                                    "app error", "force close", "stopped working", "not working"]):
@@ -387,7 +614,6 @@ def classify_issue(text: str) -> str:
     return "unknown"
 
 def looks_like_issue(text: str) -> bool:
-    """Rough heuristic: does this message sound like a support issue?"""
     text_l = text.lower()
     issue_keywords = [
         "not working", "not playing", "crash", "error", "issue", "problem", "bug",
@@ -430,23 +656,16 @@ def split_text(text: str, max_len: int = 4000) -> list[str]:
 # ─── GROQ CALLS ───────────────────────────────────────────────────────────────
 
 def _groq_call_with_failover(**kwargs):
-    """
-    Tries each Groq key in turn until one succeeds.
-    On failure marks the key bad (triggers immediate rotation) and tries the next.
-    Raises the last exception only if every key is exhausted.
-    """
     last_exc = None
     for _ in range(len(GROQ_API_KEYS)):
         used_key = groq_mgr.current_key()
         try:
             result = groq_mgr.client.chat.completions.create(**kwargs)
-            logger.debug("Groq call succeeded with key ...%s", used_key[-6:])
             return result
         except Exception as e:
             last_exc = e
             logger.warning("Groq key ...%s error: %s — switching key…", used_key[-6:], e)
             groq_mgr.mark_failed(used_key)
-            # Small pause so the new key has a moment before we hammer it
             time.sleep(0.5)
     logger.error("All Groq keys exhausted. Last error: %s", last_exc)
     raise last_exc
@@ -459,7 +678,7 @@ async def ask_groq(user_id: int, user_message: str, system_prompt: str = SYSTEM_
 
     history.append({"role": "user", "content": stamped_message})
     if len(history) > MAX_HISTORY:
-        user_histories[user_id] = history[-MAX_HISTORY:]
+        history = history[-MAX_HISTORY:]
 
     tools = [
         {"type": "browser_search"},
@@ -506,12 +725,14 @@ async def ask_groq(user_id: int, user_message: str, system_prompt: str = SYSTEM_
                     args = json.loads(tool_call.function.arguments)
                     improved_prompt = args.get("improved_prompt", "")
                     logger.info("Generating image with prompt: %s", improved_prompt)
+                    save_history(user_id, history)
                     return ("image_pending", improved_prompt)
 
         reply = (message.content or "").strip()
         if not reply:
             reply = "Hmm, got nothing back. Try asking again?"
         history.append({"role": "assistant", "content": reply})
+        save_history(user_id, history)
         return ("text", reply)
 
     except Exception as e:
@@ -520,7 +741,6 @@ async def ask_groq(user_id: int, user_message: str, system_prompt: str = SYSTEM_
 
 
 async def ask_groq_group(issue_text: str, context_info: str = "") -> str:
-    """One-shot call for group issue responses. No history needed."""
     system = GROUP_SYSTEM_PROMPT
     if context_info:
         system += f"\n\n## Context\n{context_info}"
@@ -580,7 +800,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
-    user_histories.pop(update.effective_user.id, None)
+    db.clear_history(update.effective_user.id)
     await update.message.reply_text("Done, memory wiped 🧹 Fresh start!")
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -589,30 +809,27 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Running `{GROQ_MODEL}` via Groq ⚡", parse_mode="Markdown")
 
 async def cmd_setowner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Let the first person to run this in private chat claim owner status."""
-    global OWNER_USER_ID
     if update.effective_chat.type != "private":
         await update.message.reply_text("Run this in our private chat 👀")
         return
-    if OWNER_USER_ID and OWNER_USER_ID != update.effective_user.id:
+    current_owner = get_owner_id()
+    user_id = update.effective_user.id
+    if current_owner and current_owner != user_id:
         await update.message.reply_text("Owner is already set. Can't override!")
         return
-    OWNER_USER_ID = update.effective_user.id
+    set_owner_id(user_id)
     await update.message.reply_text(
-        f"✅ You're registered as my owner! I'll DM you about group issues.\nYour ID: `{OWNER_USER_ID}`",
+        f"✅ You're registered as my owner! I'll DM you about group issues.\nYour ID: `{user_id}`",
         parse_mode="Markdown"
     )
-    logger.info("Owner set to user ID: %d", OWNER_USER_ID)
+    logger.info("Owner set to user ID: %d", user_id)
 
 
 async def cmd_groupstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner-only command: show live group activity summary."""
     user_id = update.effective_user.id
-    # Allow from private chat or from inside a group (for convenience)
     if user_id != get_owner_id():
         await update.message.reply_text("This command is for the owner only 🔒")
         return
-    # If run inside a specific group, summarise just that group
     if update.effective_chat.type in ("group", "supergroup"):
         summary = build_group_status(update.effective_chat.id)
     else:
@@ -622,13 +839,11 @@ async def cmd_groupstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle DMs — full AI assistant mode, with owner group-status shortcut."""
     user_id = update.effective_user.id
     text    = update.message.text or ""
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    # ── Owner asking about group activity → answer from live state ────────────
     if user_id == get_owner_id() and is_owner_group_query(text):
         summary = build_group_status()
         for chunk in split_text(summary):
@@ -649,14 +864,14 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             except Exception as e:
                 logger.error("Failed to send photo: %s", e)
                 await update.message.reply_text(f"[Image]({image_url})", parse_mode="Markdown")
-            get_history(user_id).append({
-                "role": "assistant", "content": "Image generated successfully."
-            })
+            history = get_history(user_id)
+            history.append({"role": "assistant", "content": "Image generated successfully."})
+            save_history(user_id, history)
         else:
             await update.message.reply_text("Image server threw a fit 😅 Try again in a bit?")
-            get_history(user_id).append({
-                "role": "assistant", "content": "Image generation failed."
-            })
+            history = get_history(user_id)
+            history.append({"role": "assistant", "content": "Image generation failed."})
+            save_history(user_id, history)
     else:
         for chunk in split_text(payload):
             await update.message.reply_text(chunk, parse_mode="Markdown")
@@ -665,10 +880,6 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 # ─── GROUP HANDLERS ───────────────────────────────────────────────────────────
 
 async def on_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Fires when the bot's membership status changes in any chat.
-    Used to register groups the moment the bot is added — before any messages.
-    """
     result = update.my_chat_member
     if not result:
         return
@@ -682,12 +893,8 @@ async def on_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id    = chat.id
 
     if new_status in ("member", "administrator"):
-        known_groups[chat_id] = {"title": chat_title, "username": chat_uname}
-        logger.info(
-            "Bot added to group: '%s' (@%s) id=%d status=%s",
-            chat_title, chat_uname, chat_id, new_status
-        )
-        # Greet the group so users know the bot is active
+        db.upsert_group(chat_id, chat_title, chat_uname)
+        logger.info("Bot added to group: '%s' (@%s) id=%d", chat_title, chat_uname, chat_id)
         if is_drishya_group(chat_title, chat_uname):
             try:
                 await context.bot.send_message(
@@ -703,24 +910,20 @@ async def on_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning("Could not greet group %d: %s", chat_id, e)
 
     elif new_status in ("left", "kicked"):
-        known_groups.pop(chat_id, None)
+        db.remove_group(chat_id)
         logger.info("Bot removed from group '%s' id=%d", chat_title, chat_id)
 
 def is_bot_mentioned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if the bot was @mentioned or replied to in the message."""
     bot_username = context.bot.username
     msg = update.message
 
-    # Direct reply to bot's message
     if msg.reply_to_message and msg.reply_to_message.from_user:
         if msg.reply_to_message.from_user.username == bot_username:
             return True
 
-    # @mention in text
     if msg.text and f"@{bot_username}".lower() in msg.text.lower():
         return True
 
-    # Mention entities
     if msg.entities:
         for entity in msg.entities:
             if entity.type == "mention":
@@ -733,7 +936,6 @@ def is_bot_mentioned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool
 
 async def notify_owner(context: ContextTypes.DEFAULT_TYPE, group_title: str, chat_id: int,
                         user_name: str, issue_text: str, issue_type: str):
-    """DM the owner about an unresolved/unknown group issue."""
     owner_id = get_owner_id()
     if not owner_id:
         logger.warning("Owner ID not set — can't send DM.")
@@ -750,11 +952,7 @@ async def notify_owner(context: ContextTypes.DEFAULT_TYPE, group_title: str, cha
         f"[Go to group](tg://openmessage?chat_id={str(chat_id).replace('-100', '')})"
     )
     try:
-        await context.bot.send_message(
-            chat_id=owner_id,
-            text=msg,
-            parse_mode="Markdown"
-        )
+        await context.bot.send_message(chat_id=owner_id, text=msg, parse_mode="Markdown")
         logger.info("Notified owner about issue in group %s", group_title)
     except Exception as e:
         logger.error("Failed to DM owner: %s", e)
@@ -769,13 +967,11 @@ async def delayed_group_response(
     chat_title: str,
     issue_key: str,
 ):
-    """
-    Wait ISSUE_WAIT_SECS, then check if the issue was resolved.
-    If not, respond in group and notify owner.
-    """
     await asyncio.sleep(ISSUE_WAIT_SECS)
 
-    issue = group_issues.get(chat_id, {}).get(issue_key)
+    # Re-fetch issue state from DB
+    issues = db.get_issues(chat_id)
+    issue  = issues.get(issue_key)
     if not issue or issue.get("resolved"):
         logger.info("Issue already resolved, skipping delayed response.")
         return
@@ -783,7 +979,6 @@ async def delayed_group_response(
     issue_type = classify_issue(issue_text)
     logger.info("Issue unresolved after wait, responding. Type: %s", issue_type)
 
-    # Generate AI response for the group
     context_info = (
         f"Group: {chat_title}\n"
         f"Issue type (pre-classified): {issue_type}\n"
@@ -803,25 +998,13 @@ async def delayed_group_response(
     except Exception as e:
         logger.error("Failed to send group reply: %s", e)
 
-    # Notify owner if it's an unknown/app issue
-    if issue_type in ("unknown", "app"):
-        await notify_owner(context, chat_title, chat_id, user_name, issue_text, issue_type)
-    
-    # Also notify for provider issues (owner should know)
-    elif issue_type == "provider":
+    if issue_type in ("unknown", "app", "provider"):
         await notify_owner(context, chat_title, chat_id, user_name, issue_text, issue_type)
 
-    # Mark as handled
-    issue["resolved"] = True
+    db.resolve_issue(chat_id, issue_key)
 
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Smart group message handler.
-    - Responds immediately if @mentioned or replied to.
-    - If it looks like an issue, waits ISSUE_WAIT_SECS then steps in if unresolved.
-    - Ignores casual chatter.
-    """
     msg = update.message
     if not msg or not msg.text:
         return
@@ -835,26 +1018,20 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     message_id = msg.message_id
     text       = msg.text.strip()
 
-    # Register group (store both title and username for reliable matching)
-    known_groups[chat_id] = {"title": chat_title, "username": chat_uname}
+    # Persist group info and message
+    db.upsert_group(chat_id, chat_title, chat_uname)
     record_group_message(chat_id, user_name, text)
 
-    # Detect if this is the Drishya support group
     in_drishya_group = is_drishya_group(chat_title, chat_uname)
+    mentioned        = is_bot_mentioned(update, context)
 
-    mentioned = is_bot_mentioned(update, context)
-
-    # ── Case 1: Bot is directly mentioned / replied to ──────────────────────
+    # ── Case 1: Bot is directly mentioned / replied to ────────────────────────
     if mentioned:
-        # Strip the @botname from the message
         bot_username = context.bot.username
-        clean_text = text.replace(f"@{bot_username}", "").strip()
-        if not clean_text:
-            clean_text = text
+        clean_text = text.replace(f"@{bot_username}", "").strip() or text
 
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-        # Use group-context system prompt for Drishya groups
         sys_prompt = GROUP_SYSTEM_PROMPT if in_drishya_group else SYSTEM_PROMPT
         result = await ask_groq(user.id, clean_text, system_prompt=sys_prompt)
         kind, payload = result
@@ -873,31 +1050,26 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             for chunk in split_text(payload):
                 await msg.reply_text(chunk, parse_mode="Markdown")
 
-        # If this was an issue, mark it resolved
         if in_drishya_group:
-            issue_key = f"{message_id}"
-            if chat_id in group_issues and issue_key in group_issues[chat_id]:
-                group_issues[chat_id][issue_key]["resolved"] = True
+            db.resolve_issue(chat_id, f"{message_id}")
         return
 
-    # ── Case 2: Drishya group — watch for issues ─────────────────────────────
+    # ── Case 2: Drishya group — watch for issues ──────────────────────────────
     if in_drishya_group and looks_like_issue(text):
         issue_key = f"{message_id}"
-        if chat_id not in group_issues:
-            group_issues[chat_id] = {}
-
-        now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
-        group_issues[chat_id][issue_key] = {
-            "message_id": message_id,
-            "text":       text,
-            "user":       user_name,
-            "time":       time.time(),
-            "time_str":   now_ist.strftime("%I:%M %p"),
-            "resolved":   False,
-        }
+        now_ist   = datetime.now(ZoneInfo("Asia/Kolkata"))
+        db.upsert_issue(
+            chat_id=chat_id,
+            issue_key=issue_key,
+            message_id=message_id,
+            text=text,
+            user_name=user_name,
+            created_at=time.time(),
+            time_str=now_ist.strftime("%I:%M %p"),
+            resolved=False,
+        )
         logger.info("Issue tracked in group '%s': %s", chat_title, text[:80])
 
-        # Schedule a delayed check
         asyncio.create_task(
             delayed_group_response(
                 context, chat_id, message_id,
@@ -906,20 +1078,15 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    # ── Case 3: A follow-up message in the group — check if it resolves an issue ──
-    if in_drishya_group and chat_id in group_issues:
-        # If someone (owner or another user) seems to have replied and resolved things,
-        # mark recent unresolved issues as resolved.
+    # ── Case 3: Follow-up that might resolve an open issue ───────────────────
+    if in_drishya_group:
         resolve_keywords = ["fixed", "resolved", "done", "sorted", "will fix", "noted",
                              "on it", "looking into", "check", "update soon", "pushed", "patched"]
         if any(k in text.lower() for k in resolve_keywords):
-            for key, issue in group_issues.get(chat_id, {}).items():
-                if not issue["resolved"] and (time.time() - issue["time"]) < ISSUE_WAIT_SECS * 2:
-                    issue["resolved"] = True
-                    logger.info("Issue auto-resolved based on reply: %s", text[:60])
+            db.resolve_recent_issues(chat_id, within_secs=ISSUE_WAIT_SECS * 2)
+            logger.info("Auto-resolved open issues based on reply: %s", text[:60])
 
     # ── Case 4: Pure chatter — do nothing ────────────────────────────────────
-    # (No response, bot stays quiet)
 
 
 # ─── HTTP HEALTH SERVER ───────────────────────────────────────────────────────
@@ -972,10 +1139,8 @@ def main():
         .build()
     )
 
-    # ── Membership tracking (fires when bot is added/removed from groups) ─────
     app.add_handler(ChatMemberHandler(on_bot_added, ChatMemberHandler.MY_CHAT_MEMBER))
 
-    # ── Private chat handlers ──────────────────────────────────────────────
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("help",        cmd_help))
     app.add_handler(CommandHandler("clear",       cmd_clear))
@@ -988,8 +1153,6 @@ def main():
         handle_private_message
     ))
 
-    # ── Group handlers ────────────────────────────────────────────────────
-    app.add_handler(CommandHandler("groupstatus", cmd_groupstatus))  # works in-group too
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
         handle_group_message
