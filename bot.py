@@ -17,13 +17,21 @@ logger = logging.getLogger(__name__)
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
 TELEGRAM_TOKEN = "8579991087:AAHm-i4Jzsv4mX8lHGgL-lFBnHo164y_GPY"
-GROQ_API_KEY   = "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"
 GROQ_MODEL     = "openai/gpt-oss-120b"
 IMAGE_API_BASE = "https://bitter-forest-7e87.shashwat-coding.workers.dev"
 IMAGE_ENDPOINT = "/flux-klein"
 MAX_HISTORY    = 10
 RENDER_URL     = "https://miniature-fishstick-9xmr.onrender.com"
 PORT           = 8080
+
+# ── Groq API keys (failover pool) ─────────────────────────────────────────────
+# Add as many keys as you want. Bot auto-switches on error and re-tests failed keys.
+GROQ_API_KEYS = [
+    "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",
+    "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",
+]
+# How long (seconds) to wait before retrying a failed key
+KEY_RETRY_SECS = 120  # 2 minutes
 
 # ── Owner config ──────────────────────────────────────────────────────────────
 OWNER_USER_ID   = None          # Set via /setowner command, or hardcode your Telegram user ID here e.g. 123456789
@@ -46,7 +54,112 @@ DRISHYA_INFO = {
     ),
 }
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+# ─── GROQ KEY MANAGER ────────────────────────────────────────────────────────
+
+class GroqKeyManager:
+    """
+    Manages a pool of Groq API keys with automatic failover and recovery.
+
+    - Always tries the current active key first.
+    - On any API error, marks that key failed and immediately rotates to the
+      next healthy key, so the next request uses a working key.
+    - Background thread re-tests failed keys every KEY_RETRY_SECS; if a key
+      recovers it's silently put back into rotation.
+    """
+
+    def __init__(self, keys: list[str], retry_secs: int = 120):
+        if not keys:
+            raise ValueError("Must provide at least one Groq API key.")
+        self._keys       = list(keys)
+        self._retry_secs = retry_secs
+        self._failed_at: dict[str, float] = {}   # key -> epoch of failure
+        self._active_idx = 0
+        self._lock       = threading.Lock()
+        self._clients: dict[str, Groq] = {k: Groq(api_key=k) for k in keys}
+        logger.info("GroqKeyManager ready with %d key(s).", len(keys))
+        threading.Thread(target=self._recovery_loop, daemon=True).start()
+
+    # ── Public ────────────────────────────────────────────────────────────────
+
+    @property
+    def client(self) -> Groq:
+        """Groq client for the current active key."""
+        return self._clients[self._current_key]
+
+    def current_key(self) -> str:
+        return self._current_key
+
+    def mark_failed(self, key: str):
+        """Call this when a key throws an error. Always records failure and rotates."""
+        with self._lock:
+            self._failed_at[key] = time.time()   # always refresh timestamp
+            logger.warning("Groq key ...%s marked failed, rotating now.", key[-6:])
+            self._rotate()
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    @property
+    def _current_key(self) -> str:
+        return self._keys[self._active_idx]
+
+    def _healthy_keys(self) -> list[str]:
+        """Keys not currently marked as failed (regardless of retry window)."""
+        return [k for k in self._keys if k not in self._failed_at]
+
+    def _rotate(self):
+        """Pick the next healthy key (must be called inside self._lock)."""
+        healthy = self._healthy_keys()
+        if not healthy:
+            logger.error("ALL Groq keys failing — using least-recently-failed as fallback.")
+            fallback = min(self._failed_at, key=lambda k: self._failed_at[k])
+            self._active_idx = self._keys.index(fallback)
+            logger.info("Fallback to Groq key ...%s", fallback[-6:])
+            return
+        # Prefer a key that isn't the current one
+        current = self._current_key
+        candidates = [k for k in healthy if k != current] or healthy
+        chosen = candidates[0]
+        self._active_idx = self._keys.index(chosen)
+        logger.info("Rotated to Groq key ...%s", chosen[-6:])
+
+    def _probe(self, key: str) -> bool:
+        """Tiny test call to see if a key is working again."""
+        try:
+            self._clients[key].chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": "Hi"}],
+                max_completion_tokens=5,
+                stream=False,
+            )
+            return True
+        except Exception:
+            return False
+
+    def _recovery_loop(self):
+        """Background: probe failed keys every retry window."""
+        while True:
+            time.sleep(self._retry_secs)
+            with self._lock:
+                recovered = []
+                for key, ts in list(self._failed_at.items()):
+                    if time.time() - ts < self._retry_secs:
+                        continue   # not ready to retry yet
+                    logger.info("Probing Groq key ...%s for recovery…", key[-6:])
+                    if self._probe(key):
+                        recovered.append(key)
+                        logger.info("Groq key ...%s recovered ✅", key[-6:])
+                    else:
+                        self._failed_at[key] = time.time()   # reset retry timer
+                        logger.info("Groq key ...%s still failing ❌", key[-6:])
+                for key in recovered:
+                    del self._failed_at[key]
+                # If current active key just recovered-or-was-already-healthy, stay put
+                # If it's still failed, rotate to something healthy
+                if self._current_key in self._failed_at:
+                    self._rotate()
+
+
+groq_mgr = GroqKeyManager(GROQ_API_KEYS, retry_secs=KEY_RETRY_SECS)
 
 # ─── PROMPTS ──────────────────────────────────────────────────────────────────
 
@@ -213,6 +326,29 @@ def split_text(text: str, max_len: int = 4000) -> list[str]:
 
 # ─── GROQ CALLS ───────────────────────────────────────────────────────────────
 
+def _groq_call_with_failover(**kwargs):
+    """
+    Tries each Groq key in turn until one succeeds.
+    On failure marks the key bad (triggers immediate rotation) and tries the next.
+    Raises the last exception only if every key is exhausted.
+    """
+    last_exc = None
+    for _ in range(len(GROQ_API_KEYS)):
+        used_key = groq_mgr.current_key()
+        try:
+            result = groq_mgr.client.chat.completions.create(**kwargs)
+            logger.debug("Groq call succeeded with key ...%s", used_key[-6:])
+            return result
+        except Exception as e:
+            last_exc = e
+            logger.warning("Groq key ...%s error: %s — switching key…", used_key[-6:], e)
+            groq_mgr.mark_failed(used_key)
+            # Small pause so the new key has a moment before we hammer it
+            time.sleep(0.5)
+    logger.error("All Groq keys exhausted. Last error: %s", last_exc)
+    raise last_exc
+
+
 async def ask_groq(user_id: int, user_message: str, system_prompt: str = SYSTEM_PROMPT):
     history = get_history(user_id)
     timestamp = get_timestamp()
@@ -245,7 +381,7 @@ async def ask_groq(user_id: int, user_message: str, system_prompt: str = SYSTEM_
     ]
 
     try:
-        completion = groq_client.chat.completions.create(
+        completion = _groq_call_with_failover(
             model=GROQ_MODEL,
             messages=[{"role": "system", "content": system_prompt}] + history,
             temperature=0.7,
@@ -276,14 +412,12 @@ async def ask_groq(user_id: int, user_message: str, system_prompt: str = SYSTEM_
         return ("text", reply)
 
     except Exception as e:
-        logger.error("Groq error: %s", e)
-        return ("text", "Something broke on my end 😬 Try again?")
+        logger.error("Groq ask_groq exhausted all keys: %s", e)
+        return ("text", "Something broke on my end 😬 Try again in a moment?")
 
 
 async def ask_groq_group(issue_text: str, context_info: str = "") -> str:
-    """
-    One-shot call for group issue responses. No history needed.
-    """
+    """One-shot call for group issue responses. No history needed."""
     system = GROUP_SYSTEM_PROMPT
     if context_info:
         system += f"\n\n## Context\n{context_info}"
@@ -292,7 +426,7 @@ async def ask_groq_group(issue_text: str, context_info: str = "") -> str:
     prompt = f"[{timestamp}]\nUser reported: {issue_text}"
 
     try:
-        completion = groq_client.chat.completions.create(
+        completion = _groq_call_with_failover(
             model=GROQ_MODEL,
             messages=[
                 {"role": "system", "content": system},
@@ -309,7 +443,7 @@ async def ask_groq_group(issue_text: str, context_info: str = "") -> str:
         reply = (completion.choices[0].message.content or "").strip()
         return reply or "I've noted this — the owner will look into it soon!"
     except Exception as e:
-        logger.error("Groq group error: %s", e)
+        logger.error("Groq ask_groq_group exhausted all keys: %s", e)
         return "I've noted this — the owner will look into it soon! 🙏"
 
 
