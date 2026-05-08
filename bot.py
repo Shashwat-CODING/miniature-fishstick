@@ -29,6 +29,7 @@ PORT           = 8080
 GROQ_API_KEYS = [
     "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",
     "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",
+    "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",
 ]
 # How long (seconds) to wait before retrying a failed key
 KEY_RETRY_SECS = 120  # 2 minutes
