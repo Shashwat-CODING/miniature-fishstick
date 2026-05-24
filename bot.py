@@ -41,7 +41,7 @@ GROQ_API_KEYS = [
 KEY_RETRY_SECS = 120
 
 # ── Owner config ──────────────────────────────────────────────────────────────
-OWNER_USER_ID_HARDCODED = None  # <- hardcode your numeric Telegram ID here if desired
+OWNER_USER_ID_HARDCODED = None  # <- hardcode your numic Telegram ID here if desired
 
 # ── Group config ──────────────────────────────────────────────────────────────
 GROUP_NAME_KEYWORDS = ["drishya"]
